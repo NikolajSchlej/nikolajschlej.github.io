@@ -71,12 +71,12 @@
 
 
 
-<img src=".&#x2F;hp1_logo.png" alt="Hydroph0bia logo" />
+<p><img src="../hydroph0bia-part1/hp1_logo.png" alt="Hydroph0bia logo" /></p>
 <p>This post will be about a vulnerability I dubbed Hydroph0bia (as a pun on Insyde H2O) aka CVE-2025-4275 or INSYDE-SA-2025002.</p>
 <h1 id="intro">Intro</h1>
 <p>Once upon an evening a relative handed me over his <a href="https://consumer.huawei.com/sa-en/laptops/matebook-14-2023/specs/">HUAWEI Matebook 14 2023</a>, an entry-level PC laptop based on Intel Core i5-1240P and running Insyde H2O-based UEFI-compatible firmware with SecureBoot, firmware password, and other security features expected from a modern PC.</p>
 <p>I had a ton of free time after leaving California and returning to Germany, and my UEFI reversing skills got a bit rusty and needed a refresh, so I decided to invest some time into checking how robust those security technologies really are against somewhat capable and/or experienced attacker.</p>
-<p>The result is self evident - <strong>they sadly are not</strong>. The firmware can be persuaded to trust any arbitrary external application or capsule signed by arbitrary certificate, and the only capabilities reqired for it are "can put files onto EFI System Partition" and "can create new NVRAM variables", both of which are achievable by a local privilege escalation<sup class="footnote-reference"><a href="#1">1</a></sup> in Windows or Linux.</p>
+<p>The result is self evident - <strong>they sadly are not</strong>. The firmware can be persuaded to trust any arbitrary external application or capsule signed by arbitrary certificate, and the only capabilities required for it are "can put files onto EFI System Partition" and "can create new NVRAM variables", both of which are achievable by a local privilege escalation<sup class="footnote-reference"><a href="#1">1</a></sup> in Windows or Linux.</p>
 <h1 id="nvram">NVRAM?</h1>
 <p>As all of you might already know, UEFI provides an abstract interface to a non-volatile variable storage it calls NVRAM (Non-Volatile Random Access Memory). The interface itself is very old (a vintage of <a href="https://vzimmer.blogspot.com/2018/10/ghosts-of.html">Intel Boot Initiative of 1998</a>), prone to <a href="https://www.binarly.io/blog/efixplorer-hunting-uefi-firmware-nvram-vulnerabilities">many issues big and small</a>, and is <em>an API so nice you have to call it twice</em>.</p>
 <p>It is also prone to an issue I've discovered a while ago and <a href="https://x.com/NikolajSchlej/status/1584456875126362112">ranted about on Twitter</a> - <em>"shadowing"</em>, a situation where a non-volatile variable with a given name and GUID can both prevent creation of a volatile variable with the same name and GUID (which immediately defeats the <em>"attributes are a part of the key"</em> assertion made by UEFI specification), and be consumed instead said volatile variable (that could not have been created previously, because a non-volatile one already exists) at any place where the volatile variable had been expected.</p>
@@ -102,13 +102,11 @@
 </li>
 <li>
 <p>BdsDxe does that by setting two variables - <em>SecureFlashSetupMode</em>  trigger, and <em>SecureFlashCertData</em> with a certificate in EFI_SIGNATURE_LIST format.
-<img src=".&#x2F;hp1_loadcerts.png" alt="LoadCertificateToVariable function in BdsDxe decompiled by IDA 9.1 with efiXplorer" />
-</p>
+<img src="../hydroph0bia-part1/hp1_loadcerts.png" alt="LoadCertificateToVariable function in BdsDxe decompiled by IDA 9.1 with efiXplorer" /></p>
 </li>
 <li>
 <p>SecurityStubDxe reads the trigger and the certificate and if they are both present attempts the verification process. It does not check either variables to be volatile or non-volatile, and uses a library function to read them instead of calling the GetVariable runtime service directly.
-<img src=".&#x2F;hp1_verify.png" alt="VerifyBySecureFlashSignature function in SecurityStubDxe decompiled by IDA 9.1 with efiXplorer" />
-</p>
+<img src="..hydroph0bia-part1/hp1_verify.png" alt="VerifyBySecureFlashSignature function in SecurityStubDxe decompiled by IDA 9.1 with efiXplorer" /></p>
 </li>
 </ol>
 <p><em>What could go wrong here?</em> Well, if we are able to create our own non-volatile <em>SecureFlashSetupMode</em> and <em>SecureFlashCertData</em> without triggering any other steps above, SecurityStubDxe will happily see those as if BdsDxe created them, and will blindly trust anything that is correctly signed with the provided certificate, bypassing both SecureBoot and Insyde signature check on <em>isflash.bin</em>.</p>
@@ -209,8 +207,7 @@
 </span><span>}
 </span></code></pre>
 <p>Running this tool on Windows from Administrator makes the firmware trust everything signed by our certificate, including UEFI drivers that we can then run rather early in BDS phase by using the DriverXXXX mechanism. Here is an example of using a signed CrScreenshotDxe driver to get a screenshot from BIOS Setup screen with SecureBoot enabled.
-<img src=".&#x2F;hp1_screenshot.png" alt="Screenshot of BIOS Setup screen with SecureBoot enabled" />
-</p>
+<img src="../hydroph0bia-part1/hp1_screenshot.png" alt="Screenshot of BIOS Setup screen with SecureBoot enabled" /></p>
 <h1 id="outro">Outro</h1>
 <p>This post is a result of coordinated responsible disclosure with <a href="https://www.kb.cert.org/vuls/">CERT Coordination Center</a>.
 I would like to thank Vijay Sarvepalli (Security Solutions Architect, Carnegie Mellon University) for his help with reporting and coordination, and Tim Lewis (CTO, Insyde Software) for promptly fixing the vulnerability after my initial report 90 days ago.</p>
