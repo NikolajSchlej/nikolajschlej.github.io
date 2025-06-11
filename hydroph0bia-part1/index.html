@@ -106,7 +106,7 @@
 </li>
 <li>
 <p>SecurityStubDxe reads the trigger and the certificate and if they are both present attempts the verification process. It does not check either variables to be volatile or non-volatile, and uses a library function to read them instead of calling the GetVariable runtime service directly.
-<img src="..hydroph0bia-part1/hp1_verify.png" alt="VerifyBySecureFlashSignature function in SecurityStubDxe decompiled by IDA 9.1 with efiXplorer" /></p>
+<img src="../hydroph0bia-part1/hp1_verify.png" alt="VerifyBySecureFlashSignature function in SecurityStubDxe decompiled by IDA 9.1 with efiXplorer" /></p>
 </li>
 </ol>
 <p><em>What could go wrong here?</em> Well, if we are able to create our own non-volatile <em>SecureFlashSetupMode</em> and <em>SecureFlashCertData</em> without triggering any other steps above, SecurityStubDxe will happily see those as if BdsDxe created them, and will blindly trust anything that is correctly signed with the provided certificate, bypassing both SecureBoot and Insyde signature check on <em>isflash.bin</em>.</p>
